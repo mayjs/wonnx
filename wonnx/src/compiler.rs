@@ -135,6 +135,11 @@ lazy_static! {
             include_str!("../templates/endomorphism/broadcast.wgsl"),
         )
         .unwrap();
+        tera.add_raw_template(
+            "unpool/convtranspose.wgsl",
+            include_str!("../templates/unpool/convtranspose.wgsl"),
+        )
+        .unwrap();
         tera
     };
 }
@@ -1382,6 +1387,104 @@ pub fn compile(
                 scalar_type: agreed_type(input_shapes, output_shapes)?,
                 template: "matrix/transpose.wgsl",
                 threads: (ceil(output_lengths[0], 256) as _, 1, 1),
+            }
+        }
+        "ConvTranspose" => {
+            /* Inputs:
+             *      1. X Input (N x C x H x W; Batch Size x Channels x Height x Weight)
+             *      2. Kernel
+             *      3. Bias
+             */
+            log::debug!("{:?}", input_shapes);
+
+            if input_shapes[0].rank() != 4 {
+                /* FIXME: We don't handle non-2D input for now */
+                return Err(CompileError::InvalidInputShape {
+                    input_index: 0,
+                    input_shape: input_shapes[0].clone(),
+                });
+            }
+
+            /* Step 1: Get the input dimensions */
+            let input_height = input_shapes[0].dims[2] as i64;
+            let input_width = input_shapes[0].dims[3] as i64;
+
+            /* Step 2: Read attributes */
+            /* TODO: auto_pad */
+            let dilations = node.get_attribute_value("dilations", Some(vec![1, 1]))?;
+
+            let group = node.get_attribute_value("group", Some(1))?;
+            if group != 1 {
+                return Err(CompileError::InvalidAttributeValue {
+                    attribute: "group".into(),
+                    value: group.to_string(),
+                    opset_version,
+                });
+            }
+
+            let inferred_kernel_shape = input_shapes[1]
+                .dims
+                .iter()
+                .skip(2)
+                .map(|&x| x as i64)
+                .collect::<Vec<_>>();
+
+            let kernel_shape =
+                node.get_attribute_value("kernel_shape", Some(inferred_kernel_shape.clone()))?;
+            if inferred_kernel_shape != kernel_shape {
+                log::error!("Inferred kernel shape: {:?}", inferred_kernel_shape);
+                return Err(CompileError::InvalidAttributeValue {
+                    attribute: "kernel_shape".to_string(),
+                    value: format!("{:?}", kernel_shape),
+                    opset_version,
+                });
+            }
+
+            let output_padding = node.get_attribute_value("output_padding", Some(vec![0, 0]))?;
+
+            let pads = node.get_attribute_value("pads", Some(vec![0, 0, 0, 0]))?;
+
+            let strides = node.get_attribute_value("strides", Some(vec![1, 1]))?;
+
+            context.insert("stride", &strides);
+
+            let output_height = strides[0] * (input_height - 1)
+                + output_padding[0]
+                + ((kernel_shape[0] - 1) * dilations[0] + 1)
+                - pads[0]
+                - pads[2];
+            let output_width = strides[1] * (input_width - 1)
+                + output_padding[1]
+                + ((kernel_shape[1] - 1) * dilations[1] + 1)
+                - pads[1]
+                - pads[3];
+
+            log::debug!(
+                "Calculated output size: {:?}x{:?}",
+                output_width,
+                output_height
+            );
+
+            let (x_threads, workgroup_size_x) = workgroup_size(
+                output_lengths[0],
+                MAX_COMPUTE_WORKGROUPS_PER_DIMENSION,
+                MAX_WORKGROUP_SIZE_X,
+            )?;
+            context.insert("workgroup_size_x", &workgroup_size_x);
+
+            let scalar_type = agreed_type(input_shapes, output_shapes)?;
+
+            if scalar_type.is_float() {
+                NodeTemplate {
+                    scalar_type,
+                    template: "unpool/convtranspose.wgsl",
+                    threads: (x_threads, 1, 1),
+                }
+            } else {
+                return Err(CompileError::UnimplementedVariant {
+                    variant: "Non-Float".into(),
+                    op: "ConvTranspose".into(),
+                });
             }
         }
         op => return Err(CompileError::UnimplementedOp(op.to_string())),
